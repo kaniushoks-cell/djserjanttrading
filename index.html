@@ -996,6 +996,27 @@ async function fetchRVOL(stock){
         if((sigCount[sig]||0)>maxCount){maxCount=sigCount[sig];dominant=sig;}
       });
       var confirmed=maxCount>=3;
+      // Same signal over the last 5 COMPLETED sessions: during market hours today's bar holds
+      // partial volume, which reads as "quiet" (used by Model 2, same as the agent)
+      stock.volSignal5Closed=dominant;
+      var ts=d.chart.result[0].timestamp||[];
+      var etNow=new Date(new Date().toLocaleString('en-US',{timeZone:'America/New_York'}));
+      var etMin=etNow.getHours()*60+etNow.getMinutes();
+      var lastBarDay=ts.length?new Date(ts[ts.length-1]*1000).toLocaleDateString('en-US',{timeZone:'America/New_York'}):'';
+      if(etNow.getDay()>0&&etNow.getDay()<6&&etMin>=570&&etMin<960&&lastBarDay===etNow.toLocaleDateString('en-US')){
+        var cc5=closes5.slice(0,-1),vv5=vols5.slice(0,-1);
+        var avgC=vv5.slice(-21,-1).reduce(function(a,b){return a+b;},0)/Math.min(vv5.length-1,20);
+        var sigsC=[];
+        for(var dj=0;dj<5;dj++){
+          var cj=cc5.length-5+dj,vj=vv5.length-5+dj;
+          if(cj<1||vj<0)continue;
+          sigsC.push(classifyDay((cc5[cj]-cc5[cj-1])/cc5[cj-1]*100,avgC>0?vv5[vj]/avgC:1));
+        }
+        var cntC={},maxC=0,domC=sigsC[sigsC.length-1];
+        sigsC.forEach(function(x){cntC[x]=(cntC[x]||0)+1;});
+        priority.forEach(function(x){if((cntC[x]||0)>maxC){maxC=cntC[x];domC=x;}});
+        stock.volSignal5Closed=domC;
+      }
       stock.volSignal5=dominant;
       stock.volSignal5Confirmed=confirmed;
       stock.volSignal5Count=maxCount;
@@ -1291,6 +1312,62 @@ function exitSignal(s){
   if(pct>=4)return'watchexit';
   return'hold';
 }
+// ─── MODEL 2: three layers (same rules as the Telegram agent, signal_engine.py) ───
+// 1. Quality: margin >= 8%, D/E <= 1.5 (utilities 2.5), 0 < P/E <= strategy limit,
+//    no earnings within 7 days, not in a 1yr+2yr downtrend.
+// 2. Cheapness: >= 9% below EWA AND price >= 10% below POC -> WAIT ENTRY (half position).
+// 3. Timing, 2 of 3 -> BUY: sellers exhausted on volume (5 completed days), RSI < 40 and turning up,
+//    OBV 10d/20d accumulation. FALLING = OBV falling with price on all of 10d/20d/60d.
+// Strategy 4: VALUE BUY ZONE = 15%+ below the 52-week high with quality ok.
+var M2={minMargin:8,maxDE:1.5,maxDEUtil:2.5,pocPct:-10,valueDrawdown:15,valueMaxPE:35};
+function m2Quality(s){
+  if(s.margin==null)return'no margin data';
+  if(s.margin<M2.minMargin)return'margin '+fmt(s.margin,1)+'% < '+M2.minMargin+'%';
+  var deMax=/Utilities/.test(s.g)?M2.maxDEUtil:M2.maxDE;
+  if(s.de!=null&&(s.de<0||s.de>deMax))return s.de<0?'negative equity':'D/E '+fmt(s.de,2)+' > '+deMax;
+  var pe=s.fpe||s.pe,peMax=s.s===4?M2.valueMaxPE:s.s===1?25:s.s===3?40:35;
+  if(pe!=null&&(pe<=0||pe>peMax))return pe<=0?'no earnings (P/E <= 0)':'P/E '+fmt(pe,1)+' > '+peMax;
+  return null;
+}
+function m2Timing(s){
+  var p=[];
+  if(s.volSignal5Closed==='capitulation'||s.volSignal5Closed==='weak_sell')p.push('volume');
+  if(s.rsi!=null&&s.rsi<40&&s.rsi2w!=null&&s.rsi>s.rsi2w)p.push('RSI');
+  if(s.obvSignal10==='bullish'||s.obvSignal20==='bullish')p.push('OBV');
+  return p;
+}
+function entrySignalM2(s){
+  if(!s.price)return'hold';
+  var soon=false;
+  if(s.nextEarn){var d=daysUntil(s.nextEarn);soon=d!=null&&d>=0&&d<=7;}
+  if(s.s===4){
+    if(!s.w52hi||s.price>s.w52hi*(1-M2.valueDrawdown/100))return'value4';
+    if(soon)return'waitevent';
+    return m2Quality(s)?'fundblock':'valuebuy';
+  }
+  var bl=s.ewa||s.base;if(!bl)return'hold';
+  var ewaChg=(s.price-bl)/bl*100;
+  if(ewaChg>-5)return'hold';
+  if(soon)return'waitevent';
+  if(m2Quality(s))return'fundblock';
+  if(s.t1==='down'&&s.t2==='down')return'trendblock';
+  var pocOk=s.poc!=null&&(s.price-s.poc)/s.poc*100<=M2.pocPct;
+  if(ewaChg>-9||!pocOk)return pocOk?'watchpoc':'watch';
+  if(s.obvSignal10==='confirm_down'&&s.obvSignal20==='confirm_down'&&s.obvSignal==='confirm_down')return'falling';
+  return m2Timing(s).length>=2?'confirmed':'waitentry';
+}
+function m2Pill(s){
+  var sig=entrySignalM2(s);
+  var why=sig==='fundblock'?m2Quality(s):sig==='confirmed'||sig==='waitentry'?'timing: '+(m2Timing(s).join(', ')||'none')+' (need 2 of 3)':'';
+  var t=why?' title="'+why+'"':'';
+  var m={confirmed:['p-confirmed','BUY &#9733;'],waitentry:['p-waitevent','WAIT ENTRY'],watchpoc:['p-watch','WATCH POC'],
+    watch:['p-watch','WATCH'],falling:['p-trendblock','FALLING'],trendblock:['p-trendblock','TREND BLOCK'],
+    fundblock:['p-fundblock','FUND RISK'],waitevent:['p-waitevent','WAIT EVENT'],valuebuy:['p-confirmed','VALUE BUY'],hold:['p-hold','HOLD']};
+  if(sig==='value4')return'<span style="color:rgba(96,165,250,.7);font-size:10px;font-family:var(--font-mono)">VALUE</span>';
+  var x=m[sig]||m.hold;
+  return'<span class="pill '+x[0]+'"'+t+'>'+x[1]+'</span>';
+}
+
 function buyScore(s){
   if(!s.price)return 0;var sc=0;
   var b=s.ewa;
@@ -1345,6 +1422,7 @@ var TIPS={
   volprofile:{title:'Volume Profile - Profit Holders Distribution',body:'Shows where most trading volume occurred over the past 52 weeks and what it means for sell pressure.\n\nProfit Holders % = percentage of yearly volume traded BELOW current price. These shareholders bought cheaper and are IN PROFIT. They are the ones who will sell on bad news.\n\nLow profit holders (under 30%) = few people in profit = weak sell pressure = safe to buy the dip.\nHigh profit holders (over 60%) = most holders in profit = expect heavy selling on bad news = risky entry.\n\nPOC = Point of Control = price level with MOST volume. Acts as price magnet - prices tend to return here.\n\nMini bar chart: green bars = bought below current price (in profit), red bars = bought above (in loss).',colors:[{c:'var(--buy)',l:'Under 30% in profit - weak sell pressure, safe floor'},{c:'var(--watch)',l:'30-60% - mixed, be careful'},{c:'var(--sell)',l:'Over 60% in profit - heavy sell risk on bad news'}]},
   analystrating:{title:'Analyst Consensus Rating',body:'Wall Street analyst consensus recommendation from Yahoo Finance.\n\nStrong Buy = majority say buy aggressively\nBuy = majority recommend buying\nHold = mixed opinion, wait\nSell / Strong Sell = majority say exit\n\nNumber in brackets = how many analysts cover this stock. More analysts = more reliable consensus.',colors:[{c:'var(--buy)',l:'Strong Buy / Buy - analysts bullish'},{c:'var(--watch)',l:'Hold - mixed opinion'},{c:'var(--sell)',l:'Sell / Strong Sell - analysts bearish'}]},
   insider:{title:'Insider Activity - Last 90 Days',body:'Net open market transactions by company insiders (CEO, CFO, Directors, major shareholders) over the past 90 days.\n\nOnly counts open market buys and sells - NOT stock grants, options exercises, or automatic trading plans.\n\nInsiders buying their own stock during a dip is one of the strongest signals available. They know the company better than any analyst.\n\nPositive = net buyers. Negative = net sellers.',colors:[{c:'var(--buy)',l:'Green: net buyers - insiders confident'},{c:'var(--muted)',l:'Grey: no activity or neutral'},{c:'var(--sell)',l:'Red: net sellers - insiders cautious'}]},
+  signal2:{title:'Model 2 - Three Layers',body:'Same rules as the Telegram agent (its Model 2 paper portfolio).\n\n1. QUALITY (all required): profit margin 8%+, D/E up to 1.5 (utilities 2.5), P/E above 0 and within the strategy limit, no earnings within 7 days, not falling on both the 1yr and 2yr trend.\n\n2. CHEAP: 9%+ below EWA AND price at least 10% below POC = WAIT ENTRY (buy half).\n\n3. TIMING, 2 of 3 = BUY: sellers exhausted on volume (last 5 completed days), RSI below 40 and turning up, OBV 10d/20d accumulation (Bull Div).\n\nFALLING: OBV falls together with price on 10d, 20d and 60d - no sign the selling is ending.\n\nStrategy 4: VALUE BUY = 15%+ below the 52-week high, quality ok.\n\nHover a pill for the reason.',colors:[{c:'var(--buy)',l:'BUY / VALUE BUY - all layers pass'},{c:'#64b4ff',l:'WAIT ENTRY - cheap, waiting for timing; WAIT EVENT - earnings'},{c:'var(--watch)',l:'WATCH / WATCH POC / FUND RISK'},{c:'var(--sell)',l:'TREND BLOCK / FALLING - do not buy'}]},
   signal:{title:'Entry Signal - Your Criteria',body:'Based on your personal trading logic:\n\nCONFIRMED BUY: EWA negative + POC above price + P/E within limit + Margin > 0% + D/E ok + OBV not Bear Div + Vol Signal shows Capitulation or Weak Sell + RSI turning up. All conditions met.\n\nWAIT ENTRY: EWA negative + POC above price + fundamentals ok + OBV clear - but Vol Signal or RSI not yet confirming the entry timing. Setup is ready, wait for the moment.\n\nWATCH POC: EWA negative + POC already above price + fundamentals ok - but dip not deep enough yet (less than 9% below EWA).\n\nWATCH: EWA negative but POC still below current price - stock approaching buy zone but POC not yet aligned.\n\nBEAR TRAP: Setup looks good but OBV 20d or 60d shows Bear Div - smart money is distributing. Do not buy, this is a trap.\n\nFUND RISK: P/E > 35 (or >25 for Strategy 1), negative margin, or D/E too high. Company fundamentals fail.\n\nWAIT EVENT: Earnings within 7 days - hold off regardless of other signals.\n\nHOLD: Price above EWA - no dip exists.',colors:[{c:'var(--buy)',l:'CONFIRMED BUY - all conditions met'},{c:'rgba(79,217,170,.5)',l:'WAIT ENTRY - setup ready, wait for timing'},{c:'var(--watch)',l:'WATCH / WATCH POC - approaching'},{c:'var(--sell)',l:'BEAR TRAP / FUND RISK - do not buy'},{c:'#64b4ff',l:'WAIT EVENT - earnings too close'},{c:'var(--muted)',l:'HOLD - no dip'}]},
   cost:{title:'Cost and Invested',body:'Your price per share and total capital deployed.'},
   pnl:{title:'P&L',body:'Dollar gain/loss and % return on your position.'},
@@ -1675,7 +1753,7 @@ function buildTheads(){
     ['Analyst','rating / count','analystrating'],
     ['Insiders','90d net','insider'],
     ['Next Event','upcoming','nextevent'],
-    ['Last Event','earnings','lastevent'],['Signal','entry','signal'],['','',null]
+    ['Last Event','earnings','lastevent'],['Signal','entry','signal'],['Model 2','3 layers','signal2'],['','',null]
   ];
   cols.forEach(function(c){addTh(bt,c[0],c[1],c[2]);});
   var st=document.getElementById('sell-thead');
@@ -2132,6 +2210,7 @@ function renderBuy(){
       '<td>'+nextEvCell+'</td>',
       '<td>'+lastEvCell+'</td>',
       '<td>'+sigHtml+'</td>',
+      '<td>'+m2Pill(s)+'</td>',
       '<td></td>'
     ];
     tr.innerHTML=tds.join('');
